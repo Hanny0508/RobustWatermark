@@ -306,12 +306,12 @@ class GenerativeErrorPredictor(nn.Module):
 
 
 # -------------------- 3. 判别器（优化版：支持中间特征提取） --------------------
+# Main.py 中的 Discriminator 类（修改后）
+# Main.py 中的 Discriminator 类（完整版本）
 class Discriminator(nn.Module):
     """DCGAN判别器：支持中间特征提取，用于多域闭环融合"""
-
     def __init__(self, in_channels=3):
         super().__init__()
-        # 拆分模块，便于获取中间特征
         self.layer1 = nn.Sequential(
             nn.Conv2d(in_channels, 64, 4, 2, 1),
             nn.LeakyReLU(0.2, inplace=True)
@@ -332,15 +332,20 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, x):
-        """前向传播：输出判别评分"""
+        """前向传播：输出4维张量（batch, 1, h, w）"""
         x1 = self.layer1(x)
         x2 = self.layer2(x1)
         x3 = self.layer3(x2)
         x4 = self.layer4(x3)
-        return x4
+        return x4  # 保留4维张量，不做mean
+
+    def get_score(self, x):
+        """新增：获取全局平均评分（适配trainer.py的需求）"""
+        x4 = self.forward(x)
+        return x4.mean(dim=[1, 2, 3])  # 输出：(batch,) → 1维张量
 
     def get_intermediate_features(self, x):
-        """获取中间层特征（layer3输出），用于特征匹配损失"""
+        """获取中间层特征（layer3输出）"""
         x1 = self.layer1(x)
         x2 = self.layer2(x1)
         x3 = self.layer3(x2)
@@ -369,6 +374,7 @@ class DiscriminatorRefineHead(nn.Module):
             nn.Conv2d(64, in_channels, 1, 1, 0)
         )
 
+    # Main.py 中的 DiscriminatorRefineHead.forward（无需修改，现在可正常运行）
     def forward(self, x):
         """
         x: 提取的秘密图像（0~1）
@@ -385,7 +391,7 @@ class DiscriminatorRefineHead(nn.Module):
         x_concat = torch.cat([x_refine, disc_feat], dim=1)
         x_fused = self.feat_fusion(x_concat)
 
-        # 自适应修复强度
+        # 自适应修复强度（现在self.disc(x_refine)是4维张量，mean后正常）
         disc_score = self.disc(x_refine).mean(dim=[1, 2, 3]).view(-1, 1, 1, 1)
         refine_strength = torch.clamp(1 - disc_score, 0.1, 1.0)
 
