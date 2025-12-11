@@ -419,7 +419,7 @@ class EnhancedPRIS(nn.Module):
             secret: 提取的秘密图像 (batch, 3, h, w)
         """
         # 1. 容器图像通道数适配可逆块（3→64）
-        container_pad = F.pad(container, (0, 0, 0, 0, 0, c.target_channels - 3))  # (batch, 64, h, w)
+        container_pad = F.pad(container, (0， 0, 0， 0, 0, c.target_channels - 3))  # (batch, 64, h, w)
 
         # 2. 可逆块逆向操作（提取局部特征）
         local_feat_rev = self.reversible(container_pad, rev=True)  # (batch, 64, h, w)
@@ -431,7 +431,7 @@ class EnhancedPRIS(nn.Module):
 
     # 可选：保留forward方法（兼容原有调用方式，可选删除）
     def forward(self, x, y=None, rev=False):
-        if not rev and y is not None:
+        if not rev 和 y is not 无:
             return self.embed(x, y)
         else:
             return self.extract(x)
