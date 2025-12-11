@@ -1,63 +1,132 @@
 import os
-import glob
-import random
-from PIL import Image
 import torch
-from torch.utils.data import Dataset
+from PIL import Image
+import numpy as np
 from torchvision import transforms
 import config as c
+from model import EnhancedPRIS
+from Main import attack_image
 
-class StegoDataset(Dataset):
-    """隐写术数据集：从同一文件夹自动拆分host和secret（无需单独secret文件夹）"""
-    def __init__(self, is_train=True):
-        # 数据集路径（直接使用config中的TRAIN_PATH/VAL_PATH，无secret子路径）
-        self.root = c.TRAIN_PATH if is_train else c.VAL_PATH
-        self.img_format = c.format_train if is_train else c.format_val
 
-        # 步骤1：读取文件夹内所有图像路径
-        self.img_paths = glob.glob(os.path.join(self.root, f'*.{self.img_format}'))
-        if len(self.img_paths) == 0:
-            raise ValueError(f"未找到图像，请检查路径: {self.root}，格式: {self.img_format}")
+class StegoInference:
+    """隐写术推理工具：实现图像隐写和秘密提取"""
 
-        # 步骤2：拆分host和secret（两种方案选其一，推荐方案1）
-        # ========== 方案1：随机配对（推荐，数量不变，每个host对应随机secret） ==========
-        self.host_paths = self.img_paths  # host用所有图像
-        self.secret_paths = self.img_paths.copy()  # secret用相同列表，然后随机打乱
-        random.shuffle(self.secret_paths)  # 打乱secret列表，实现随机配对
+    def __init__(self, checkpoint_path):
+        # 设备配置
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # ========== 方案2：均分列表（前一半为host，后一半为secret，数量减半） ==========
-        # split_idx = len(self.img_paths) // 2
-        # self.host_paths = self.img_paths[:split_idx]
-        # self.secret_paths = self.img_paths[split_idx:]
+        # 初始化模型
+        self.gen = EnhancedPRIS()。到(self.device)
+        self._load_checkpoint(checkpoint_path)
+        self.gen.eval()
 
-        # 确保host和secret数量匹配（方案1必然匹配，方案2也匹配）
-        self.length = min(len(self.host_paths), len(self.secret_paths))
-
-        # 数据预处理（与模型输入适配，保持原有逻辑）
+        # 图像预处理（与训练一致）
         self.transform = transforms.Compose([
-            transforms.RandomCrop(c.cropsize if is_train else c.cropsize_val),
-            transforms.RandomHorizontalFlip(p=0.5) if is_train else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),  # 转为0~1张量
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # 归一化到-1~1（适配DCGAN的Tanh输出）
+            transforms.ToTensor()，
+            transforms.Normalize(mean=[0.5， 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
-    def __len__(self):
-        return self.length
+        # 图像后处理（将张量转为PIL图像）
+        self.postprocess = transforms.Compose([
+            transforms.Normalize(mean=[-1, -1, -1], std=[2, 2, 2]),  # 从-1~1转回0~1
+            transforms.ToPILImage()
+        ])
 
-    def __getitem__(self, idx):
-        # 加载宿主图像和秘密图像（从同一文件夹的不同图像中读取）
-        host_img = Image.open(self.host_paths[idx]).convert('RGB')
-        secret_img = Image.open(self.secret_paths[idx]).convert('RGB')
+    def _load_checkpoint(self, checkpoint_path):
+        """加载模型权重"""
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"模型文件不存在: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.gen.load_state_dict(checkpoint["gen_state_dict"])
+        print(f"成功加载模型: {checkpoint_path}")
 
-        # 预处理
-        host = self.transform(host_img)
-        secret = self.transform(secret_img)
+    def embed(self, host_path, secret_path, attack_type=None, save_container=False, save_path=None):
+        """
+        隐写：将秘密图像嵌入宿主图像生成容器图像
+        Args:
+            host_path: 宿主图像路径
+            secret_path: 秘密图像路径
+            attack_type: 攻击类型（可选，如"fgsm"）
+            save_container: 是否保存容器图像
+            save_path: 容器图像保存路径
+        Returns:
+            容器图像（PIL格式）
+        """
+        # 加载并预处理图像
+        host = Image.open(host_path).convert('RGB')
+        secret = Image.open(secret_path).convert('RGB')
+        host_tensor = self.transform(host).unsqueeze(0).to(self.device)
+        secret_tensor = self.transform(secret)。unsqueeze(0).to(self.device)
 
-        return host, secret
+        # 生成容器图像
+        with torch.no_grad():
+            container_tensor = self.gen.embed(host_tensor, secret_tensor)
 
-# 测试数据集加载（可保留，用于验证）
+        # 施加攻击（可选）
+        if attack_type in c.supported_attacks:
+            container_tensor = attack_image(container_tensor, attack_type)
+
+        # 后处理为PIL图像
+        container = self.postprocess(container_tensor.squeeze(0).cpu())
+
+        # 保存容器图像
+        if save_container and save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            container.save(save_path)
+            print(f"容器图像已保存至: {save_path}")
+
+        return container
+
+    def extract(self, container_path, save_secret=False, save_path=None):
+        """
+        提取：从容器图像中提取秘密图像
+        Args:
+            container_path: 容器图像路径
+            save_secret: 是否保存提取的秘密图像
+            save_path: 秘密图像保存路径
+        Returns:
+            提取的秘密图像（PIL格式）
+        """
+        # 加载并预处理容器图像
+        container = Image.open(container_path).convert('RGB')
+        container_tensor = self.transform(container).unsqueeze(0).to(self.device)
+
+        # 提取秘密图像
+        with torch.no_grad():
+            secret_tensor = self.gen.extract(container_tensor)
+
+        # 后处理为PIL图像
+        extracted_secret = self.postprocess(secret_tensor.squeeze(0).cpu())
+
+        # 保存提取的秘密图像
+        if save_secret and save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            extracted_secret.save(save_path)
+            print(f"提取的秘密图像已保存至: {save_path}")
+
+        return extracted_secret
+
+
+# 示例用法
 if __name__ == "__main__":
-    dataset = StegoDataset(is_train=True)
-    host, secret = dataset[0]
-    print(f"宿主图像形状: {host.shape}, 秘密图像形状: {secret.shape}")
-    print(f"数据集总长度: {len(dataset)}")
+    # 初始化推理器（使用最佳模型）
+    checkpoint = os.path.join(c.CHECKPOINT_PATH, "best_model.pth")
+    stego = StegoInference(checkpoint)
+
+    # 隐写示例
+    host_img = os.path.join(c.IMAGE_PATH_host, "test_host.png")
+    secret_img = os.path.join(c.IMAGE_PATH_secret, "test_secret.png")
+    container = stego.embed(
+        host_path=host_img,
+        secret_path=secret_img,
+        attack_type=None,  # 不施加攻击
+        save_container=True,
+        save_path=os.path.join(c.IMAGE_PATH_container, "test_container.png")
+    )
+
+    # 提取示例
+    extracted = stego.extract(
+        container_path=os.path.join(c.IMAGE_PATH_container, "test_container.png"),
+        save_secret=True,
+        save_path=os.path.join(c.IMAGE_PATH_extracted, "test_extracted.png")
+    )
