@@ -6,36 +6,62 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from PIL import Image
+import torchvision.utils as vutils
+
+# 导入自定义模块
 import config as c
-
 from data import StegoDataset
-from Main import PSNR, SSIM, attack_image, DCGANGenerator, GenerativeErrorPredictor, DiscriminatorRefineHead, \
+from Main import (
+    PSNR, SSIM, attack_image, DCGANGenerator,
+    GenerativeErrorPredictor, DiscriminatorRefineHead,
     DynamicWeightBalancer
-from model import EnhancedPRIS, PZMsFeatureExtractor, ReversibleBlock, FeatureFusionModule
+)
+from model import (
+    EnhancedPRIS, PZMsFeatureExtractor,
+    ReversibleBlock, FeatureFusionModule
+)
 
-
-# 定义判别器（DCGAN风格）
+# 定义判别器（DCGAN风格，拆分模块以获取中间层特征）
 class Discriminator(nn.Module):
     """判别器：区分正常图像和容器图像，辅助生成器优化"""
-
     def __init__(self, in_channels=3):
         super().__init__()
-        self.model = nn.Sequential(
+        # 拆分为多个模块，便于获取中间层特征（闭环融合所需）
+        self.layer1 = nn.Sequential(
             nn.Conv2d(in_channels, 64, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.layer2 = nn.Sequential(
             nn.Conv2d(64, 128, 4, 2, 1),
             nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.layer3 = nn.Sequential(
             nn.Conv2d(128, 256, 4, 2, 1),
             nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 1, 4, 1, 0),  # 输出单通道评分
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.layer4 = nn.Sequential(
+            nn.Conv2d(256, 1, 4, 1, 0),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        return self.model(x).mean(dim=[1, 2, 3])  # 全局平均评分
+        """前向传播：输出全局平均评分"""
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
+        return x4.mean(dim=[1, 2, 3])  # 全局平均评分
 
+    def get_intermediate_features(self, x):
+        """获取中间层特征（layer3输出，用于特征匹配损失）"""
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        return x3  # 返回中间层特征
 
 class Trainer:
     def __init__(self):
@@ -49,7 +75,7 @@ class Trainer:
         self.error_predictor = GenerativeErrorPredictor().to(self.device)  # 误差预判器
         self.refine_head = DiscriminatorRefineHead(disc=self.disc).to(self.device)  # 修复头
         self.pzms_extractor = PZMsFeatureExtractor(max_order=c.pzms_max_order).to(self.device)  # PZMs提取器
-        # 修正：从config读取基础权重初始化动态权重平衡器（可选，根据需求）
+        # 动态权重平衡器（支持传入当前损失值）
         self.weight_balancer = DynamicWeightBalancer(
             base_weights={
                 'cap': c.base_capacity_weight,
@@ -57,27 +83,130 @@ class Trainer:
                 'imp': c.base_imperceptibility_weight
             }
         )
-
+        self.training = True
         # 优化器
         self.opt_gen = optim.Adam(self.gen.parameters(), lr=c.lr_gen, betas=c.betas)
         self.opt_disc = optim.Adam(self.disc.parameters(), lr=c.lr_disc, betas=c.betas)
+
+        # 学习率调度器（解决学习率固定问题）
+        self.scheduler_gen = optim.lr_scheduler.StepLR(
+            self.opt_gen, step_size=c.lr_step_size, gamma=c.lr_gamma
+        )
+        self.scheduler_disc = optim.lr_scheduler.StepLR(
+            self.opt_disc, step_size=c.lr_step_size, gamma=c.lr_gamma
+        )
 
         # 损失函数
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCELoss()
 
-        # 数据集和加载器：Windows下num_workers改为0（避免多进程数据加载错误）
+        # 数据集和加载器（Windows下num_workers=0避免多进程错误）
         self.train_dataset = StegoDataset(is_train=True)
         self.val_dataset = StegoDataset(is_train=False)
-        self.train_loader = DataLoader(self.train_dataset, batch_size=c.batch_size, shuffle=True, num_workers=0)
-        self.val_loader = DataLoader(self.val_dataset, batch_size=c.batchsize_val, shuffle=c.shuffle_val, num_workers=0)
+        self.train_loader = DataLoader(
+            self.train_dataset, batch_size=c.batch_size, shuffle=True, num_workers=0
+        )
+        self.val_loader = DataLoader(
+            self.val_dataset, batch_size=c.batchsize_val, shuffle=c.shuffle_val, num_workers=0
+        )
 
         # 日志和检查点
         self.writer = SummaryWriter(c.LOG_PATH)
         os.makedirs(c.CHECKPOINT_PATH, exist_ok=True)
-        self.best_psnr = 0.0  # 最佳验证PSNR
+        os.makedirs(c.SAMPLE_IMAGE_PATH, exist_ok=True)  # 示例图片保存目录
+        self.best_psnr = 0.0  # 最佳验证PSNR（秘密提取）
+        self.best_psnr_container = 0.0  # 最佳验证PSNR（容器与宿主）
+
+    def load_checkpoint(self, checkpoint_path):
+        """加载检查点（最佳模型或断点续训）"""
+        if os.path.exists(checkpoint_path):
+            # 加载检查点并映射到当前设备
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.gen.load_state_dict(checkpoint['gen_state_dict'])
+            self.disc.load_state_dict(checkpoint['disc_state_dict'])
+            # 可选：加载优化器状态（断点续训需要）
+            if 'opt_gen_state_dict' in checkpoint:
+                self.opt_gen.load_state_dict(checkpoint['opt_gen_state_dict'])
+            if 'opt_disc_state_dict' in checkpoint:
+                self.opt_disc.load_state_dict(checkpoint['opt_disc_state_dict'])
+            # 恢复最佳PSNR和起始epoch
+            self.best_psnr = checkpoint.get('best_psnr', self.best_psnr)
+            start_epoch = checkpoint.get('epoch', 0) + 1  # 从下一个epoch开始
+            print(f"✅ 加载检查点成功：{checkpoint_path}")
+            print(f"  - 恢复到Epoch: {start_epoch}")
+            print(f"  - 历史最佳PSNR（秘密）：{self.best_psnr:.2f} dB")
+            return start_epoch
+        else:
+            print(f"❌ 未找到检查点：{checkpoint_path}，将从头开始训练")
+            return 0
+
+    def save_sample_images(self, epoch=None, num_samples=5):
+        """保存示例图片：宿主、容器、原秘密、提取的秘密"""
+        self.gen.eval()
+        save_dir = os.path.join(c.SAMPLE_IMAGE_PATH, f"epoch_{epoch}" if epoch else "final")
+        os.makedirs(save_dir, exist_ok=True)
+
+        with torch.no_grad():
+            for idx, (host, secret) in enumerate(self.val_loader):
+                if idx >= num_samples:
+                    break  # 只保存指定数量的样本
+
+                # 前向传播
+                host = host.to(self.device)
+                secret = secret.to(self.device)
+                container = self.gen.embed(host, secret)
+                extracted_secret = self.gen.extract(container)
+                extracted_refined = self.refine_head(extracted_secret)
+
+                # 转换为[0, 1]范围（适配图像保存）
+                def tensor_to_01(tensor):
+                    return (tensor.cpu() + 1) / 2  # 从[-1,1]转[0,1]
+
+                # 取batch中的第一个样本（维度：C×H×W）
+                host_01 = tensor_to_01(host[0])
+                container_01 = tensor_to_01(container[0])
+                secret_01 = tensor_to_01(secret[0])
+                extracted_refined_01 = tensor_to_01(extracted_refined[0])
+
+                # 转换为PIL图像（处理单通道/三通道）
+                def pil_convert(tensor):
+                    if tensor.shape[0] == 1:  # 单通道（灰度图）
+                        return Image.fromarray((tensor.squeeze(0).numpy() * 255).astype(np.uint8), mode='L')
+                    else:  # 三通道（RGB图）
+                        return Image.fromarray((tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8), mode='RGB')
+
+                # 保存单个图像
+                pil_convert(host_01).save(os.path.join(save_dir, f"sample_{idx+1}_host.png"))
+                pil_convert(container_01).save(os.path.join(save_dir, f"sample_{idx+1}_container.png"))
+                pil_convert(secret_01).save(os.path.join(save_dir, f"sample_{idx+1}_secret_ori.png"))
+                pil_convert(extracted_refined_01).save(os.path.join(save_dir, f"sample_{idx+1}_secret_ext.png"))
+
+                # 拼接图像并保存（更直观对比）
+                fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+                axes[0, 0].imshow(pil_convert(host_01))
+                axes[0, 0].set_title("Host Image", fontsize=12)
+                axes[0, 0].axis('off')
+
+                axes[0, 1].imshow(pil_convert(container_01))
+                axes[0, 1].set_title("Container Image", fontsize=12)
+                axes[0, 1].axis('off')
+
+                axes[1, 0].imshow(pil_convert(secret_01))
+                axes[1, 0].set_title("Original Secret", fontsize=12)
+                axes[1, 0].axis('off')
+
+                axes[1, 1].imshow(pil_convert(extracted_refined_01))
+                axes[1, 1].set_title("Refined Extracted Secret", fontsize=12)
+                axes[1, 1].axis('off')
+
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f"sample_{idx+1}_combined.png"), dpi=300, bbox_inches='tight')
+                plt.close()
+
+        print(f"📸 示例图片已保存至：{save_dir}")
 
     def train_one_epoch(self, epoch):
+        """训练单个Epoch"""
         self.gen.train()
         self.disc.train()
         total_loss_gen = 0.0
@@ -93,92 +222,123 @@ class Trainer:
             self.opt_disc.zero_grad()
             # 生成容器图像（-1~1范围）
             container = self.gen.embed(host, secret)
-            # 关键1：将张量从[-1,1]转换为[0,1]（适配攻击、判别器、SSIM/PSNR）
+            # 转换为[0,1]范围（适配攻击、判别器、指标计算）
             container_01 = (container + 1) / 2
-            host_01 = (host + 1) / 2  # 宿主图像同步转换
-            # 关键2：为非叶子张量保留梯度（解决grad为None的问题）
+            host_01 = (host + 1) / 2
+            # 保留梯度（攻击需要）
             container_01.retain_grad()
 
-            # 真实图像（宿主图像0~1）vs 生成图像（容器图像0~1）
+            # 判别器标签（真实=1，生成=0）
             real_label = torch.ones(batch_size, device=self.device)
             fake_label = torch.zeros(batch_size, device=self.device)
-            # 判别器损失：输入0~1范围的张量
+            # 判别器损失
             loss_real = self.bce_loss(self.disc(host_01), real_label)
             loss_fake = self.bce_loss(self.disc(container_01.detach()), fake_label)
             loss_disc = (loss_real + loss_fake) * 0.5
+            # 反向传播+优化
             loss_disc.backward()
             self.opt_disc.step()
             total_loss_disc += loss_disc.item()
 
             # -------------------- 训练生成器 --------------------
             self.opt_gen.zero_grad()
-            # 提取特征（用于动态权重）
-            texture_complexity = self.pzms_extractor.get_texture_complexity(host)
-            # 随机选择攻击类型
+            # 1. 生成式误差预判：用预测误差修正容器图像（优化创新点3）
+            if self.training:
+                pred_error = self.error_predictor(container)  # 预测误差（-1~1）
+                container = container - c.error_correction_weight * pred_error  # 误差修正
+                container = torch.clamp(container, -1.0, 1.0)  # 限制范围
+                # 重新转换为[0,1]（修正后）
+                container_01 = (container + 1) / 2
+                container_01.retain_grad()  # 重新保留梯度
+
+            # 2. 对抗攻击（随机选择攻击类型）
             attack_type = np.random.choice(c.supported_attacks)
-            # 生成带攻击的容器图像（对抗性攻击需要梯度）
             if attack_type in ['fgsm', 'pgd']:
-                # 计算判别器对容器图像的预测（用于获取梯度）
+                # 对抗攻击需要梯度
                 pred = self.disc(container_01)
                 loss_gan_temp = self.bce_loss(pred, real_label)
-                # 反向传播获取container_01的梯度（保留计算图，后续还要用）
                 loss_gan_temp.backward(retain_graph=True)
-                # 安全获取梯度：若梯度为None则用0张量
+                # 安全获取梯度（防止None）
                 container_grad = container_01.grad.detach() if container_01.grad is not None else torch.zeros_like(container_01)
-                # 执行攻击（传入0~1的张量和梯度）
+                # 执行攻击
                 container_attacked_01 = attack_image(container_01, attack_type, container_grad, c.epsilon)
             else:
-                # 非对抗攻击，直接处理0~1的张量
+                # 非对抗攻击
                 container_attacked_01 = attack_image(container_01, attack_type)
-
-            # 关键：将攻击后的图像从[0,1]转换回[-1,1]（适配模型提取方法）
+            # 转换回[-1,1]范围
             container_attacked = (container_attacked_01 * 2) - 1
 
-            # 提取秘密图像并修复
+            # 3. 提取并修复秘密
             extracted_secret = self.gen.extract(container_attacked)
             extracted_secret_refined = self.refine_head(extracted_secret)
-            # 秘密图像转换为0~1范围（用于损失计算）
+            # 转换为[0,1]范围（损失计算）
             secret_01 = (secret + 1) / 2
             extracted_secret_refined_01 = (extracted_secret_refined + 1) / 2
             extracted_secret_01 = (extracted_secret + 1) / 2
 
-            # 动态权重调整
-            cap_w, rob_w, imp_w = self.weight_balancer.adjust(texture_complexity, attack_type)
+            # 4. 动态权重调整（传入当前损失值，优化创新点2）
+            texture_complexity = self.pzms_extractor.get_texture_complexity(host)
+            # 先计算基础损失（用于动态权重）
+            loss_capacity = self.mse_loss(extracted_secret_refined_01, secret_01)
+            loss_imperceptible = 1 - SSIM(container_01, host_01)
+            loss_robustness = self.mse_loss(extracted_secret_01, extracted_secret_refined_01)
+            # 收集当前损失值
+            current_losses = {
+                'capacity': loss_capacity.item(),
+                'robustness': loss_robustness.item(),
+                'imperceptible': loss_imperceptible.item()
+            }
+            # 动态调整权重
+            cap_w, rob_w, imp_w = self.weight_balancer.adjust(texture_complexity, attack_type, current_losses)
 
-            # 三目标损失计算（全部使用0~1范围的张量）
-            loss_capacity = self.mse_loss(extracted_secret_refined_01, secret_01)  # 容量损失
-            loss_imperceptible = 1 - SSIM(container_01, host_01)  # 不可感知性损失（0~1范围计算SSIM）
-            loss_robustness = self.mse_loss(extracted_secret_01, extracted_secret_refined_01)  # 鲁棒性损失
-            # 误差预判损失：容器图像转换为0~1后计算
+            # 5. 损失计算
             loss_error = self.mse_loss((self.error_predictor(container) + 1) / 2, torch.zeros_like(container_01))
-
-            # GAN损失（生成器希望骗过判别器，输入0~1的张量）
             loss_gan = self.bce_loss(self.disc(container_01), real_label)
+            # 特征匹配损失（增强多域闭环融合，优化创新点1）
+            disc_features_real = self.disc.get_intermediate_features(host_01)
+            disc_features_fake = self.disc.get_intermediate_features(container_01)
+            loss_feat_match = self.mse_loss(disc_features_fake, disc_features_real.detach())
 
             # 总损失（加权求和）
-            loss_gen = (cap_w * loss_capacity +
-                        rob_w * loss_robustness +
-                        imp_w * loss_imperceptible +
-                        c.gan_weight * loss_gan +
-                        c.error_pred_weight * loss_error)
+            loss_gen = (
+                cap_w * loss_capacity +
+                rob_w * loss_robustness +
+                imp_w * loss_imperceptible +
+                c.gan_weight * loss_gan +
+                c.error_pred_weight * loss_error +
+                c.feat_match_weight * loss_feat_match  # 新增特征匹配损失
+            )
 
+            # 反向传播+优化
             loss_gen.backward()
             self.opt_gen.step()
             total_loss_gen += loss_gen.item()
 
-            pbar.set_postfix({"Gen Loss": loss_gen.item(), "Disc Loss": loss_disc.item()})
+            # 更新进度条
+            pbar.set_postfix({
+                "Gen Loss": f"{loss_gen.item():.4f}",
+                "Disc Loss": f"{loss_disc.item():.4f}"
+            })
 
-        # 记录日志
+        # 平均损失
         avg_loss_gen = total_loss_gen / len(self.train_loader)
         avg_loss_disc = total_loss_disc / len(self.train_loader)
+        # 记录日志
         self.writer.add_scalar("Train/Gen_Loss", avg_loss_gen, epoch)
         self.writer.add_scalar("Train/Disc_Loss", avg_loss_disc, epoch)
-        print(f"Epoch {epoch + 1} | Gen Loss: {avg_loss_gen:.4f} | Disc Loss: {avg_loss_disc:.4f}")
+        print(f"\nEpoch {epoch + 1} | Gen Loss: {avg_loss_gen:.4f} | Disc Loss: {avg_loss_disc:.4f}")
+
+        # 更新学习率
+        self.scheduler_gen.step()
+        self.scheduler_disc.step()
 
     def validate(self, epoch):
+        """验证阶段：计算PSNR/SSIM并保存最佳模型"""
         self.gen.eval()
-        total_psnr = 0.0
-        total_ssim = 0.0
+        total_psnr_secret = 0.0  # 秘密提取的PSNR
+        total_ssim_secret = 0.0  # 秘密提取的SSIM
+        total_psnr_container = 0.0  # 容器与宿主的PSNR（不可感知性）
+        total_ssim_container = 0.0  # 容器与宿主的SSIM（不可感知性）
 
         with torch.no_grad():
             for host, secret in self.val_loader:
@@ -187,50 +347,110 @@ class Trainer:
 
                 # 生成容器并提取秘密
                 container = self.gen.embed(host, secret)
-                # 转换为0~1范围
+                # 转换为[0,1]范围
                 container_01 = (container + 1) / 2
                 host_01 = (host + 1) / 2
                 secret_01 = (secret + 1) / 2
 
+                # 提取并修复秘密
                 extracted_secret = self.gen.extract(container)
                 extracted_refined = self.refine_head(extracted_secret)
-                # 转换为0~1范围用于评估
                 extracted_refined_01 = (extracted_refined + 1) / 2
 
-                # 计算指标（使用0~1范围的张量）
-                total_psnr += PSNR(extracted_refined_01, secret_01)
-                total_ssim += SSIM(extracted_refined_01, secret_01).item()
+                # 计算指标：秘密提取（原逻辑）
+                total_psnr_secret += PSNR(extracted_refined_01, secret_01)
+                total_ssim_secret += SSIM(extracted_refined_01, secret_01).item()
+                # 计算指标：容器与宿主（不可感知性，新增）
+                total_psnr_container += PSNR(container_01, host_01)
+                total_ssim_container += SSIM(container_01, host_01).item()
 
-        avg_psnr = total_psnr / len(self.val_loader)
-        avg_ssim = total_ssim / len(self.val_loader)
-        self.writer.add_scalar("Val/PSNR", avg_psnr, epoch)
-        self.writer.add_scalar("Val/SSIM", avg_ssim, epoch)
-        print(f"Validation | PSNR: {avg_psnr:.2f} dB | SSIM: {avg_ssim:.4f}")
+        # 平均指标
+        avg_psnr_secret = total_psnr_secret / len(self.val_loader)
+        avg_ssim_secret = total_ssim_secret / len(self.val_loader)
+        avg_psnr_container = total_psnr_container / len(self.val_loader)
+        avg_ssim_container = total_ssim_container / len(self.val_loader)
 
-        # 保存最佳模型
-        if avg_psnr > self.best_psnr:
-            self.best_psnr = avg_psnr
+        # 记录日志
+        self.writer.add_scalar("Val/PSNR_Secret", avg_psnr_secret, epoch)
+        self.writer.add_scalar("Val/SSIM_Secret", avg_ssim_secret, epoch)
+        self.writer.add_scalar("Val/PSNR_Container", avg_psnr_container, epoch)
+        self.writer.add_scalar("Val/SSIM_Container", avg_ssim_container, epoch)
+
+        # 打印结果
+        print(f"\n📊 Validation Results:")
+        print(f"  - Secret: PSNR = {avg_psnr_secret:.2f} dB | SSIM = {avg_ssim_secret:.4f}")
+        print(f"  - Container: PSNR = {avg_psnr_container:.2f} dB | SSIM = {avg_ssim_container:.4f}")
+
+        # 保存最佳模型（以秘密提取的PSNR为指标，可替换为容器PSNR）
+        if avg_psnr_secret > self.best_psnr:
+            self.best_psnr = avg_psnr_secret
+            self.best_psnr_container = avg_psnr_container
+            # 保存检查点（包含优化器状态，支持断点续训）
             torch.save({
                 "gen_state_dict": self.gen.state_dict(),
                 "disc_state_dict": self.disc.state_dict(),
-                "epoch": epoch
+                "opt_gen_state_dict": self.opt_gen.state_dict(),
+                "opt_disc_state_dict": self.opt_disc.state_dict(),
+                "epoch": epoch,
+                "best_psnr": self.best_psnr,
+                "best_psnr_container": self.best_psnr_container
             }, os.path.join(c.CHECKPOINT_PATH, "best_model.pth"))
-            print(f"保存最佳模型（PSNR: {avg_psnr:.2f}）")
+            print(f"✅ 保存最佳模型（Secret PSNR: {avg_psnr_secret:.2f} dB）")
+
+        return avg_psnr_secret  # 返回PSNR用于早停判断
 
     def run(self):
-        """启动训练流程"""
-        for epoch in range(c.epochs):
+        """启动训练流程（含早停、断点续训、图片保存）"""
+        # 步骤1：加载最佳模型（第二次训练时自动使用）
+        start_epoch = self.load_checkpoint(os.path。join(c.CHECKPOINT_PATH, "best_model.pth"))
+
+        # 步骤2：初始化早停参数
+        no_improve_epochs = 0
+        early_stop_triggered = False
+
+        # 步骤3：开始训练
+        for epoch in range(start_epoch, c.epochs):
+            # 训练单个epoch
             self.train_one_epoch(epoch)
+
+            # 验证+保存示例图片
             if (epoch + 1) % c.val_freq == 0:
-                self.validate(epoch)
-            if (epoch + 1) % c.save_freq == 0:
+                avg_psnr = self.validate(epoch)
+                # 保存示例图片
+                self.save_sample_images(epoch=epoch+1)
+
+                # 早停判断
+                if avg_psnr > self.best_psnr:
+                    no_improve_epochs = 0  # 重置计数器
+                else:
+                    no_improve_epochs += 1
+                    print(f"⚠️  验证PSNR连续{no_improve_epochs}轮未提升（耐心：{c.early_stop_patience}）")
+                    if no_improve_epochs >= c.early_stop_patience:
+                        print(f"🛑 早停触发，停止训练（Epoch: {epoch+1}）")
+                        early_stop_triggered = True
+                        break
+
+            # 保存断点
+            if (epoch + 1) % c.save_freq == 0 and not early_stop_triggered:
                 torch.save({
                     "gen_state_dict": self.gen.state_dict(),
                     "disc_state_dict": self.disc.state_dict(),
-                    "epoch": epoch
+                    "opt_gen_state_dict": self.opt_gen.state_dict(),
+                    "opt_disc_state_dict": self.opt_disc.state_dict(),
+                    "epoch": epoch,
+                    "best_psnr": self.best_psnr
                 }, os.path.join(c.CHECKPOINT_PATH, f"model_epoch_{epoch + 1}.pth"))
+                print(f"💾 保存断点模型：model_epoch_{epoch+1}.pth")
 
+        # 训练结束后保存最终示例图片
+        if not early_stop_triggered:
+            self.save_sample_images()  # 保存final版本
+
+        # 关闭日志写入器
+        self.writer.close()
+        print("\n🎉 训练流程完成！")
 
 if __name__ == "__main__":
+    # 实例化并启动训练
     trainer = Trainer()
     trainer.run()
