@@ -10,7 +10,7 @@ init_scale = 0.01  # 模型初始化缩放因子
 # ===================== 模型配置 =====================
 device_ids = [0]  # 多GPU训练时的设备ID（单GPU用[0]）
 target_channels = 64  # 模型中间层目标通道数（可逆块/融合模块）
-pzms_max_order = 4  # PZMs最大阶数（原8改为4，提升稳定性，匹配model.py）
+pzms_max_order = 4  # PZMs最大阶数（匹配model.py）
 
 # ===================== 训练配置 =====================
 # 基础训练参数
@@ -19,9 +19,12 @@ cropsize = 256  # 训练图像裁剪尺寸
 betas = (0.5, 0.999)  # Adam优化器的beta参数
 weight_step = 200  # 学习率衰减步长（备用）
 gamma = 0.5  # 学习率衰减系数（备用）
-epochs = 100  # 训练总轮数
+epochs = 6000  # 训练总轮数
+lr_step_size = 200  # 与 weight_step 保持一致
+lr_gamma = 0.5
 lr_gen = 2e-4  # 生成器（EnhancedPRIS）学习率
 lr_disc = 1e-4  # 判别器（DCGAN Discriminator）学习率
+early_stop_patience = 20  # 早停机制：多少轮无提升则停止（新增，用于之前建议的早停逻辑）
 
 # 模型保存配置
 save_freq = 20  # 模型检查点保存频率（每20轮保存一次）
@@ -32,20 +35,31 @@ cropsize_val = 256  # 验证图像裁剪尺寸
 batchsize_val = 2  # 验证批次大小
 shuffle_val = False  # 验证集是否打乱
 val_freq = 10  # 验证频率（每10轮验证一次）
-
-# ===================== GAN相关配置（创新点1/2/4） =====================
+# ===================== GAN相关配置 =====================
 gan_lr = 1e-4  # 判别器学习率（与lr_disc保持一致，备用）
 gan_weight = 0.1  # GAN对抗损失权重
 error_pred_weight = 0.1  # 生成式误差预判损失权重
+error_correction_weight = 0.05  # 新增：误差修正权重（用于容器图像误差修正）
 repair_weight = 0.05  # 判别器辅助修复损失权重（备用）
+feat_match_weight = 0.2  # 特征匹配损失权重
 
-# ===================== 三目标动态平衡配置（创新点3） =====================
+# 在训练配置部分添加
+lr_step_size = 100  # 学习率衰减步长
+lr_gamma = 0.9  # 学习率衰减系数
+
+# 在验证配置部分添加
+early_stop_patience = 100  # 早停耐心值（多少轮无提升则停止）
+
+# 在路径配置部分添加
+
+
+# ===================== 三目标动态平衡配置 =====================
 base_capacity_weight = 1.0  # 容量损失基础权重
 base_robustness_weight = 1.0  # 鲁棒性损失基础权重
 base_imperceptibility_weight = 1.0  # 不可感知性损失基础权重
 
-# ===================== 攻击配置（创新点4：对抗性攻击泛化） =====================
-# 支持的攻击类型（新增FGSM/PGD对抗性攻击）
+# ===================== 攻击配置 =====================
+# 支持的攻击类型
 supported_attacks = ["gaussian", "jpeg", "geometry", "fgsm", "pgd"]
 # 攻击类型说明
 attack_types = {
@@ -68,7 +82,7 @@ VAL_PATH = r'D:\pythonProject\Watermarking\DIV2K\valid'
 format_train = 'png'
 format_val = 'png'
 
-# ===================== 路径配置（Windows系统适配，修正路径错误） =====================
+# ===================== 路径配置（Windows系统适配） =====================
 # 模型保存路径
 MODEL_PATH = r'D:\pythonProject\Watermarking\Code\combined\model'
 # 图像保存路径（宿主/秘密/容器/提取图像）
@@ -77,8 +91,10 @@ IMAGE_PATH_host = fr'{IMAGE_PATH}\host'
 IMAGE_PATH_secret = fr'{IMAGE_PATH}\secret'
 IMAGE_PATH_container = fr'{IMAGE_PATH}\container'
 IMAGE_PATH_extracted = fr'{IMAGE_PATH}\extracted'
+IMAGE_PATH_combined = fr'{IMAGE_PATH}\combined'
+SAMPLE_IMAGE_PATH = fr'{IMAGE_PATH}\samples'  # 示例图片保存路径
 
-# 检查点和日志路径（与main_GAN.py匹配）
+# 检查点和日志路径
 CHECKPOINT_PATH = r'D:\pythonProject\Watermarking\Code\combined\checkpoints'
 LOG_PATH = r'D:\pythonProject\Watermarking\Code\combined\logs'
 
