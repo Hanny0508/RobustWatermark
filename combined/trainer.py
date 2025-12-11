@@ -16,52 +16,12 @@ from data import StegoDataset
 from Main import (
     PSNR, SSIM, attack_image, DCGANGenerator,
     GenerativeErrorPredictor, DiscriminatorRefineHead,
-    DynamicWeightBalancer
+    DynamicWeightBalancer, Discriminator  # 从Main导入Discriminator，不再自定义
 )
 from model import (
     EnhancedPRIS, PZMsFeatureExtractor,
     ReversibleBlock, FeatureFusionModule
 )
-
-# 定义判别器（DCGAN风格，拆分模块以获取中间层特征）
-class Discriminator(nn.Module):
-    """判别器：区分正常图像和容器图像，辅助生成器优化"""
-    def __init__(self, in_channels=3):
-        super().__init__()
-        # 拆分为多个模块，便于获取中间层特征（闭环融合所需）
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(64, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.layer3 = nn.Sequential(
-            nn.Conv2d(128, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.layer4 = nn.Sequential(
-            nn.Conv2d(256, 1, 4, 1, 0),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        """前向传播：输出全局平均评分"""
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-        return x4.mean(dim=[1, 2, 3])  # 全局平均评分
-
-    def get_intermediate_features(self, x):
-        """获取中间层特征（layer3输出，用于特征匹配损失）"""
-        x1 = self.layer1(x)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        return x3  # 返回中间层特征
 
 class Trainer:
     def __init__(self):
@@ -71,8 +31,8 @@ class Trainer:
 
         # 模型初始化
         self.gen = EnhancedPRIS().to(self.device)  # 隐写生成器
-        self.disc = Discriminator().to(self.device)  # 判别器
-        self.error_predictor = GenerativeErrorPredictor().to(self.device)  # 误差预判器
+        self.disc = Discriminator(in_channels=3).to(self.device)  # 使用Main的Discriminator
+        self.error_predictor = GenerativeErrorPredictor(in_channels=3).to(self.device)  # 传入in_channels匹配
         self.refine_head = DiscriminatorRefineHead(disc=self.disc).to(self.device)  # 修复头
         self.pzms_extractor = PZMsFeatureExtractor(max_order=c.pzms_max_order).to(self.device)  # PZMs提取器
         # 动态权重平衡器（支持传入当前损失值）
@@ -113,7 +73,7 @@ class Trainer:
         # 日志和检查点
         self.writer = SummaryWriter(c.LOG_PATH)
         os.makedirs(c.CHECKPOINT_PATH, exist_ok=True)
-        os.makedirs(c.SAMPLE_IMAGE_PATH, exist_ok=True)  # 示例图片保存目录
+        os.makedirs(c.IMAGE_PATH, exist_ok=True)  # 示例图片保存目录
         self.best_psnr = 0.0  # 最佳验证PSNR（秘密提取）
         self.best_psnr_container = 0.0  # 最佳验证PSNR（容器与宿主）
 
@@ -156,7 +116,9 @@ class Trainer:
                 secret = secret.to(self.device)
                 container = self.gen.embed(host, secret)
                 extracted_secret = self.gen.extract(container)
-                extracted_refined = self.refine_head(extracted_secret)
+                # 转换为[0,1]范围后传入refine_head
+                extracted_secret_01 = (extracted_secret + 1) / 2
+                extracted_refined = self.refine_head(extracted_secret_01)
 
                 # 转换为[0, 1]范围（适配图像保存）
                 def tensor_to_01(tensor):
@@ -166,7 +128,8 @@ class Trainer:
                 host_01 = tensor_to_01(host[0])
                 container_01 = tensor_to_01(container[0])
                 secret_01 = tensor_to_01(secret[0])
-                extracted_refined_01 = tensor_to_01(extracted_refined[0])
+                # refined是[0,1]范围，直接转换
+                extracted_refined_01 = extracted_refined.cpu().clamp(0, 1)
 
                 # 转换为PIL图像（处理单通道/三通道）
                 def pil_convert(tensor):
@@ -231,10 +194,12 @@ class Trainer:
             # 判别器标签（真实=1，生成=0）
             real_label = torch.ones(batch_size, device=self.device)
             fake_label = torch.zeros(batch_size, device=self.device)
-            # 判别器损失
-            loss_real = self.bce_loss(self.disc(host_01), real_label)
-            loss_fake = self.bce_loss(self.disc(container_01.detach()), fake_label)
+
+            # 判别器损失：使用Main.Discriminator的get_score方法
+            loss_real = self.bce_loss(self.disc.get_score(host_01), real_label)
+            loss_fake = self.bce_loss(self.disc.get_score(container_01.detach()), fake_label)
             loss_disc = (loss_real + loss_fake) * 0.5
+
             # 反向传播+优化
             loss_disc.backward()
             self.opt_disc.step()
@@ -243,9 +208,12 @@ class Trainer:
             # -------------------- 训练生成器 --------------------
             self.opt_gen.zero_grad()
             # 1. 生成式误差预判：用预测误差修正容器图像（优化创新点3）
+            pred_error_total = None
             if self.training:
-                pred_error = self.error_predictor(container)  # 预测误差（-1~1）
-                container = container - c.error_correction_weight * pred_error  # 误差修正
+                # 解包返回的元组，只取总误差（第一个值）
+                pred_error_total, _, _, _ = self.error_predictor(container)
+                # 用总误差进行修正
+                container = container - c.error_correction_weight * pred_error_total
                 container = torch.clamp(container, -1.0, 1.0)  # 限制范围
                 # 重新转换为[0,1]（修正后）
                 container_01 = (container + 1) / 2
@@ -253,48 +221,60 @@ class Trainer:
 
             # 2. 对抗攻击（随机选择攻击类型）
             attack_type = np.random.choice(c.supported_attacks)
+            container_attacked_01 = None
             if attack_type in ['fgsm', 'pgd']:
-                # 对抗攻击需要梯度
-                pred = self.disc(container_01)
-                loss_gan_temp = self.bce_loss(pred, real_label)
+                # 对抗攻击需要4维张量的梯度，调用disc的forward（返回4维）
+                pred_4d = self.disc(container_01)  # 4维张量：(batch, 1, h, w)
+                # 计算损失时用全局平均（1维）
+                loss_gan_temp = self.bce_loss(pred_4d.mean(dim=[1, 2, 3]), real_label)
                 loss_gan_temp.backward(retain_graph=True)
-                # 安全获取梯度（防止None）
+                # 安全获取梯度
                 container_grad = container_01.grad.detach() if container_01.grad is not None else torch.zeros_like(container_01)
                 # 执行攻击
                 container_attacked_01 = attack_image(container_01, attack_type, container_grad, c.epsilon)
+                # 清空梯度，避免残留
+                container_01.grad.zero_()
             else:
                 # 非对抗攻击
                 container_attacked_01 = attack_image(container_01, attack_type)
+
             # 转换回[-1,1]范围
             container_attacked = (container_attacked_01 * 2) - 1
 
             # 3. 提取并修复秘密
             extracted_secret = self.gen.extract(container_attacked)
-            extracted_secret_refined = self.refine_head(extracted_secret)
+            # 转换为[0,1]范围后传入refine_head（匹配Main的refine_head预期）
+            extracted_secret_01 = (extracted_secret + 1) / 2
+            extracted_secret_refined = self.refine_head(extracted_secret_01)  # refine_head输出[0,1]
+
+            # 4. 动态权重调整（修复键不匹配问题）
+            texture_complexity = self.pzms_extractor.get_texture_complexity(host)
             # 转换为[0,1]范围（损失计算）
             secret_01 = (secret + 1) / 2
-            extracted_secret_refined_01 = (extracted_secret_refined + 1) / 2
-            extracted_secret_01 = (extracted_secret + 1) / 2
-
-            # 4. 动态权重调整（传入当前损失值，优化创新点2）
-            texture_complexity = self.pzms_extractor.get_texture_complexity(host)
-            # 先计算基础损失（用于动态权重）
-            loss_capacity = self.mse_loss(extracted_secret_refined_01, secret_01)
+            # 计算基础损失（键改为cap/rob/imp，匹配weight_balancer）
+            loss_capacity = self.mse_loss(extracted_secret_refined, secret_01)  # refined已是[0,1]
             loss_imperceptible = 1 - SSIM(container_01, host_01)
-            loss_robustness = self.mse_loss(extracted_secret_01, extracted_secret_refined_01)
-            # 收集当前损失值
+            loss_robustness = self.mse_loss(extracted_secret_01, extracted_secret_refined)
+            # 收集当前损失值（键匹配）
             current_losses = {
-                'capacity': loss_capacity.item(),
-                'robustness': loss_robustness.item(),
-                'imperceptible': loss_imperceptible.item()
+                'cap': loss_capacity.item(),
+                'rob': loss_robustness.item(),
+                'imp': loss_imperceptible.item()
             }
             # 动态调整权重
             cap_w, rob_w, imp_w = self.weight_balancer.adjust(texture_complexity, attack_type, current_losses)
 
             # 5. 损失计算
-            loss_error = self.mse_loss((self.error_predictor(container) + 1) / 2, torch.zeros_like(container_01))
-            loss_gan = self.bce_loss(self.disc(container_01), real_label)
-            # 特征匹配损失（增强多域闭环融合，优化创新点1）
+            # 修复error_predictor的元组问题：使用之前保存的pred_error_total
+            if pred_error_total is None:
+                pred_error_total, _, _, _ = self.error_predictor(container)
+            pred_error_01 = (pred_error_total + 1) / 2  # 转换为[0,1]
+            loss_error = self.mse_loss(pred_error_01, torch.zeros_like(container_01))
+
+            # GAN损失：使用get_score方法（返回1维，匹配BCE损失）
+            loss_gan = self.bce_loss(self.disc.get_score(container_01), real_label)
+
+            # 特征匹配损失（增强多域闭环融合）
             disc_features_real = self.disc.get_intermediate_features(host_01)
             disc_features_fake = self.disc.get_intermediate_features(container_01)
             loss_feat_match = self.mse_loss(disc_features_fake, disc_features_real.detach())
@@ -306,7 +286,7 @@ class Trainer:
                 imp_w * loss_imperceptible +
                 c.gan_weight * loss_gan +
                 c.error_pred_weight * loss_error +
-                c.feat_match_weight * loss_feat_match  # 新增特征匹配损失
+                c.feat_match_weight * loss_feat_match
             )
 
             # 反向传播+优化
@@ -354,12 +334,12 @@ class Trainer:
 
                 # 提取并修复秘密
                 extracted_secret = self.gen.extract(container)
-                extracted_refined = self.refine_head(extracted_secret)
-                extracted_refined_01 = (extracted_refined + 1) / 2
+                extracted_secret_01 = (extracted_secret + 1) / 2
+                extracted_refined = self.refine_head(extracted_secret_01)
 
                 # 计算指标：秘密提取（原逻辑）
-                total_psnr_secret += PSNR(extracted_refined_01, secret_01)
-                total_ssim_secret += SSIM(extracted_refined_01, secret_01).item()
+                total_psnr_secret += PSNR(extracted_refined, secret_01)
+                total_ssim_secret += SSIM(extracted_refined, secret_01).item()
                 # 计算指标：容器与宿主（不可感知性，新增）
                 total_psnr_container += PSNR(container_01, host_01)
                 total_ssim_container += SSIM(container_01, host_01).item()
@@ -381,7 +361,7 @@ class Trainer:
         print(f"  - Secret: PSNR = {avg_psnr_secret:.2f} dB | SSIM = {avg_ssim_secret:.4f}")
         print(f"  - Container: PSNR = {avg_psnr_container:.2f} dB | SSIM = {avg_ssim_container:.4f}")
 
-        # 保存最佳模型（以秘密提取的PSNR为指标，可替换为容器PSNR）
+        # 保存最佳模型（以秘密提取的PSNR为指标）
         if avg_psnr_secret > self.best_psnr:
             self.best_psnr = avg_psnr_secret
             self.best_psnr_container = avg_psnr_container
@@ -409,7 +389,7 @@ class Trainer:
         early_stop_triggered = False
 
         # 步骤3：开始训练
-        for epoch in range(start_epoch, c.epochs):
+        for epoch 在 range(start_epoch, c.epochs):
             # 训练单个epoch
             self.train_one_epoch(epoch)
 
