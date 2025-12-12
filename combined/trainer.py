@@ -129,7 +129,7 @@ class Trainer:
                 container_01 = tensor_to_01(container[0])
                 secret_01 = tensor_to_01(secret[0])
                 # refined是[0,1]范围，直接转换
-                extracted_refined_01 = extracted_refined.cpu().clamp(0, 1)
+                extracted_refined_01 = extracted_refined[0].cpu().clamp(0, 1)
 
                 # 转换为PIL图像（处理单通道/三通道）
                 def pil_convert(tensor):
@@ -367,14 +367,14 @@ class Trainer:
             self.best_psnr_container = avg_psnr_container
             # 保存检查点（包含优化器状态，支持断点续训）
             torch.save({
-                "gen_state_dict": self.gen.state_dict(),
-                "disc_state_dict": self.disc.state_dict(),
-                "opt_gen_state_dict": self.opt_gen.state_dict(),
-                "opt_disc_state_dict": self.opt_disc.state_dict(),
+                "gen_state_dict": self.gen。state_dict()，
+                "disc_state_dict": self.disc。state_dict()，
+                "opt_gen_state_dict": self.opt_gen。state_dict()，
+                "opt_disc_state_dict": self.opt_disc。state_dict()，
                 "epoch": epoch,
-                "best_psnr": self.best_psnr,
+                "best_psnr": self.best_psnr，
                 "best_psnr_container": self.best_psnr_container
-            }, os.path.join(c.CHECKPOINT_PATH, "best_model.pth"))
+            }, os.path。join(c.CHECKPOINT_PATH, "best_model.pth"))
             print(f"✅ 保存最佳模型（Secret PSNR: {avg_psnr_secret:.2f} dB）")
 
         return avg_psnr_secret  # 返回PSNR用于早停判断
@@ -382,14 +382,14 @@ class Trainer:
     def run(self):
         """启动训练流程（含早停、断点续训、图片保存）"""
         # 步骤1：加载最佳模型（第二次训练时自动使用）
-        start_epoch = self.load_checkpoint(os.path。join(c.CHECKPOINT_PATH, "best_model.pth"))
+        start_epoch = self.load_checkpoint(os.path.join(c.CHECKPOINT_PATH, "best_model.pth"))
 
         # 步骤2：初始化早停参数
         no_improve_epochs = 0
         early_stop_triggered = False
 
         # 步骤3：开始训练
-        for epoch 在 range(start_epoch, c.epochs):
+        for epoch in range(start_epoch, c.epochs):
             # 训练单个epoch
             self.train_one_epoch(epoch)
 
@@ -414,7 +414,7 @@ class Trainer:
             if (epoch + 1) % c.save_freq == 0 and not early_stop_triggered:
                 torch.save({
                     "gen_state_dict": self.gen.state_dict(),
-                    "disc_state_dict": self.disc.state_dict(),
+                    "disc_state_dict": self.disc。state_dict()，
                     "opt_gen_state_dict": self.opt_gen.state_dict(),
                     "opt_disc_state_dict": self.opt_disc.state_dict(),
                     "epoch": epoch,
@@ -427,7 +427,7 @@ class Trainer:
             self.save_sample_images()  # 保存final版本
 
         # 关闭日志写入器
-        self.writer.close()
+        self.writer。close()
         print("\n🎉 训练流程完成！")
 
 if __name__ == "__main__":
